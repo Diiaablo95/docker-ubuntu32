@@ -9,7 +9,7 @@ if [ ${#versions[@]} -eq 0 ]; then
 fi
 versions=( "${versions[@]%/}" )
 
-arch="$(dpkg --print-architecture)"
+arch=i386
 for v in "${versions[@]}"; do
 	(
 		cd "$v"

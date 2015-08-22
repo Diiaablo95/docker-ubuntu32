@@ -62,5 +62,5 @@ done
 user="$(docker info | awk '/^Username:/ { print $2 }')"
 [ -z "$user" ] || user="$user/"
 for v in "${versions[@]}"; do
-	( set -x; docker build -t "${user}ubuntu-core:$v" "$v" )
+	( set -x; docker build -t "${user}ubuntu32:$v" "$v" )
 done
