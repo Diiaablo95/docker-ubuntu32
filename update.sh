@@ -9,30 +9,56 @@ if [ ${#versions[@]} -eq 0 ]; then
 fi
 versions=( "${versions[@]%/}" )
 
-arch="$(dpkg --print-architecture)"
+arch="$(cat arch 2>/dev/null || true)"
+: ${arch:=$(dpkg --print-architecture)}
+toVerify=()
 for v in "${versions[@]}"; do
+	thisTarBase="ubuntu-$v-core-cloudimg-$arch"
+	thisTar="$thisTarBase-root.tar.gz"
+	baseUrl="https://partner-images.canonical.com/core/$v"
+	if \
+		wget -q --spider "$baseUrl/current" \
+		&& wget -q --spider "$baseUrl/current/$thisTar" \
+	; then
+		baseUrl+='/current'
+	else
+		# appears to be missing a "current" symlink (or $arch doesn't exist in /current/)
+		# let's enumerate all the directories and try to find one that's satisfactory
+		toAttempt=( $(wget -qO- "$baseUrl/" | awk -F '</?a[^>]*>' '$2 ~ /^[0-9.]+\/$/ { gsub(/\/$/, "", $2); print $2 }' | sort -rn) )
+		current=
+		for attempt in "${toAttempt[@]}"; do
+			if wget -q --spider "$baseUrl/$attempt/$thisTar"; then
+				current="$attempt"
+				break
+			fi
+		done
+		if [ -z "$current" ]; then
+			echo >&2 "warning: cannot find 'current' for $v"
+			echo >&2 "  (checked all dirs under $baseUrl/)"
+			continue
+		fi
+		baseUrl+="/$current"
+		echo "SERIAL=$current" > "$v/build-info.txt" # this will be overwritten momentarily if this directory has one
+	fi
+	
 	(
 		cd "$v"
-		thisTarBase="ubuntu-$v-core-cloudimg-$arch"
-		thisTar="$thisTarBase-root.tar.gz"
-		baseUrl="https://partner-images.canonical.com/core/$v/current"
-		wget -qN "$baseUrl/"{{MD5,SHA{1,256}}SUMS{,.gpg},"$thisTarBase.manifest",'unpacked/build-info.txt'}
+		wget -qN "$baseUrl/"{{MD5,SHA{1,256}}SUMS{,.gpg},"$thisTarBase.manifest",'unpacked/build-info.txt'} || true
 		wget -N "$baseUrl/$thisTar"
-		sha256sum="$(sha256sum "$thisTar" | cut -d' ' -f1)"
-		if ! grep -q "$sha256sum" SHA256SUMS; then
-			echo >&2 "error: '$thisTar' has invalid SHA256"
-			exit 1
-		fi
-		cat > Dockerfile <<EOF
+	)
+	
+	cat > "$v/Dockerfile" <<EOF
 FROM scratch
 ADD $thisTar /
 EOF
-		
-		cat >> Dockerfile <<'EOF'
+	
+	cat >> "$v/Dockerfile" <<'EOF'
 
 # a few minor docker-specific tweaks
 # see https://github.com/docker/docker/blob/master/contrib/mkimage/debootstrap
-RUN echo '#!/bin/sh' > /usr/sbin/policy-rc.d \
+RUN set -xe \
+	\
+	&& echo '#!/bin/sh' > /usr/sbin/policy-rc.d \
 	&& echo 'exit 101' >> /usr/sbin/policy-rc.d \
 	&& chmod +x /usr/sbin/policy-rc.d \
 	\
@@ -50,17 +76,44 @@ RUN echo '#!/bin/sh' > /usr/sbin/policy-rc.d \
 	\
 	&& echo 'Acquire::GzipIndexes "true"; Acquire::CompressionTypes::Order:: "gz";' > /etc/apt/apt.conf.d/docker-gzip-indexes
 
+# delete all the apt list files since they're big and get stale quickly
+RUN rm -rf /var/lib/apt/lists/*
+# this forces "apt-get update" in dependent images, which is also good
+
 # enable the universe
 RUN sed -i 's/^#\s*\(deb.*universe\)$/\1/g' /etc/apt/sources.list
 
 # overwrite this with 'CMD []' in a dependent Dockerfile
 CMD ["/bin/bash"]
 EOF
-	)
+	
+	toVerify+=( "$v" )
 done
 
-user="$(docker info | awk '/^Username:/ { print $2 }')"
-[ -z "$user" ] || user="$user/"
+( set -x; ./verify.sh "${toVerify[@]}" )
+
+repo="$(cat repo 2>/dev/null || true)"
+if [ -z "$repo" ]; then
+	user="$(docker info | awk -F ': ' '$1 == "Username" { print $2; exit }')"
+	repo="${user:+$user/}ubuntu-core"
+fi
+latest="$(< latest)"
 for v in "${versions[@]}"; do
-	( set -x; docker build -t "${user}ubuntu32:$v" "$v" )
+	if [ ! -f "$v/Dockerfile" ]; then
+		echo >&2 "warning: $v/Dockerfile does not exist; skipping $v"
+		continue
+	fi
+	( set -x; docker build -t "$repo:$v" "$v" )
+	serial="$(awk -F '=' '$1 == "SERIAL" { print $2; exit }' "$v/build-info.txt")"
+	if [ "$serial" ]; then
+		( set -x; docker tag -f "$repo:$v" "$repo:$v-$serial" )
+	fi
+	if [ -s "$v/alias" ]; then
+		for a in $(< "$v/alias"); do
+			( set -x; docker tag -f "$repo:$v" "$repo:$a" )
+		done
+	fi
+	if [ "$v" = "$latest" ]; then
+		( set -x; docker tag -f "$repo:$v" "$repo:latest" )
+	fi
 done
